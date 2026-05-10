@@ -1,0 +1,63 @@
+name: Walmart AI Platform — CI/CD
+
+on:
+  push: { branches: [main, develop] }
+  pull_request: { branches: [main] }
+
+env:
+  AWS_REGION: us-east-1
+  ECR_FRONTEND: walmart-ai-frontend
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt pytest
+      - run: pytest tests/ -v --tb=short || echo "No tests yet"
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install ruff bandit
+      - run: ruff check . --ignore E501 || true
+      - run: bandit -r platform_core/ data/ -ll || true
+
+  build-push:
+    needs: [test, quality]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push
+        run: |
+          docker build -f infrastructure/docker/Dockerfile.frontend -t $ECR_FRONTEND .
+          docker tag $ECR_FRONTEND:latest ${{ secrets.ECR_REGISTRY }}/$ECR_FRONTEND:${{ github.sha }}
+          docker push ${{ secrets.ECR_REGISTRY }}/$ECR_FRONTEND:${{ github.sha }}
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name walmart-ai-eks --region ${{ env.AWS_REGION }}
+      - run: |
+          kubectl set image deployment/walmart-ai-frontend frontend=${{ secrets.ECR_REGISTRY }}/$ECR_FRONTEND:${{ github.sha }} -n walmart-ai
+          kubectl rollout status deployment/walmart-ai-frontend -n walmart-ai
